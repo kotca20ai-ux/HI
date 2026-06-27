@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Starry Night Interactive Dashboard</title>
+<title>Starry Night — Fluid Paint Dispersion (WebGL)</title>
 <style>
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -99,15 +99,35 @@ body {
 }
 
 #img-container {
+  position: relative;
   flex: 1;
   background: var(--bg-canvas);
   border: 1px solid var(--border);
   border-radius: 3px;
   overflow: hidden;
   min-height: 0;
+  cursor: crosshair;
 }
 
 #img-canvas { width: 100%; height: 100%; display: block; }
+
+#coord-readout {
+  position: absolute;
+  top: 6px; left: 8px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: rgba(232,240,255,0.92);
+  text-shadow: 0 1px 3px rgba(0,0,0,0.9);
+  pointer-events: none;
+  white-space: pre;
+}
+#gl-error {
+  position: absolute; inset: 0;
+  display: none; flex-direction: column;
+  align-items: center; justify-content: center;
+  text-align: center; color: var(--err); font-size: 12px;
+  line-height: 1.9; padding: 20px;
+}
 
 #open-bar-wrap {
   flex-shrink: 0;
@@ -126,7 +146,7 @@ body {
 #open-fill {
   height: 100%; width: 0%;
   border-radius: 2px;
-  background: linear-gradient(to right, #4050ff, #00dcff);
+  background: linear-gradient(to right, #4a7bd0, #ffcc00);
   transition: width 0.05s linear;
 }
 
@@ -216,16 +236,22 @@ body {
 <div id="dashboard">
 
   <div id="panel-left" class="panel">
-    <div class="panel-header">  IMAGE  —  WEBGL FLUID INTERACTION (STARRY NIGHT)</div>
+    <div class="panel-header">  STARRY NIGHT  —  FLUID PAINT DISPERSION (WebGL)</div>
     <div class="panel-body">
-      <button id="btn-upload">  Load Custom Image…</button>
+      <button id="btn-upload">  Open Image…</button>
       <input  id="file-input" type="file" accept="image/*">
-      <span   id="fname">Loading...</span>
+      <span   id="fname">Default: Van Gogh — The Starry Night (1889)</span>
       <div    id="img-container">
         <canvas id="img-canvas"></canvas>
+        <div id="coord-readout"></div>
+        <div id="gl-error">
+          <strong>WebGL2 unavailable</strong><br>
+          이 브라우저/환경에서는 WebGL2를 사용할 수 없습니다.<br>
+          Chrome·Edge·Firefox 최신 버전에서 열어주세요.
+        </div>
       </div>
       <div id="open-bar-wrap">
-        <span id="open-label">HAND OPENNESS  0%</span>
+        <span id="open-label">OPEN  0%</span>
         <div  id="open-track"><div id="open-fill"></div></div>
       </div>
     </div>
@@ -242,7 +268,8 @@ body {
         <div id="no-cam-msg">
           <strong>Camera unavailable</strong>
           로컬 서버로 열어주세요:<br>
-          <span style="color:var(--accent)">python -m http.server 8080</span>
+          <span style="color:var(--accent)">python -m http.server 8080</span><br>
+          <span style="color:var(--muted)">(카메라 없이도 마우스로 조작 가능)</span>
         </div>
       </div>
     </div>
@@ -277,8 +304,11 @@ const CONNECTIONS = [
 const TIPS  = new Set([4, 8, 12, 16, 20]);
 const BASES = new Set([5, 9, 13, 17]);
 
-// 위키백과 파일 페이지의 직접 이미지 링크로 기본값 설정
-const DEFAULT_IMG = "https://upload.wikimedia.org/wikipedia/commons/thumb/e/ea/Van_Gogh_-_Starry_Night_-_Google_Art_Project.jpg/1200px-Van_Gogh_-_Starry_Night_-_Google_Art_Project.jpg";
+// 기본 배경 그림: 빈센트 반 고흐 「별이 빛나는 밤」(1889) — 퍼블릭 도메인 (Wikimedia Commons)
+const DEFAULT_IMG =
+  "https://upload.wikimedia.org/wikipedia/commons/thumb/e/ea/" +
+  "Van_Gogh_-_Starry_Night_-_Google_Art_Project.jpg/1024px-" +
+  "Van_Gogh_-_Starry_Night_-_Google_Art_Project.jpg";
 
 // ── DOM refs ─────────────────────────────────────────────────────────────────
 const webcam      = document.getElementById('webcam');
@@ -290,16 +320,26 @@ const infoBody    = document.getElementById('info-body');
 const fnameEl     = document.getElementById('fname');
 const fileInput   = document.getElementById('file-input');
 const noCamMsg    = document.getElementById('no-cam-msg');
+const imgContainer= document.getElementById('img-container');
 const imgCanvas   = document.getElementById('img-canvas');
+const coordEl     = document.getElementById('coord-readout');
+const glErrEl     = document.getElementById('gl-error');
 const openFill    = document.getElementById('open-fill');
 const openLabel   = document.getElementById('open-label');
 
-const ctx  = overlay.getContext('2d');
+const ctx = overlay.getContext('2d');   // 우측 카메라 스켈레톤용 2D 컨텍스트
 
 // ── State ────────────────────────────────────────────────────────────────────
-let smoothOpen  = 0.0;
-let targetOpen  = 0.0;
+let uploadedImg = null;     // HTMLImageElement (원본 그림)
+let imgNatW = 0, imgNatH = 0;
+let smoothOpen  = 0.0, targetOpen = 0.0;
 let handPresent = false;
+
+// 커서: 모든 좌표는 '그림 uv'(GL 기준, s=0 좌, t=0 하)에서 0~1.
+let handS = 0, handT = 0, handActive = false;   // 카메라(손) 입력
+let mouseS = 0, mouseT = 0, mouseActive = false; // 마우스 폴백
+// 커서 속도(셰이더 스월/물결 방향성에 사용)
+let prevCS = 0, prevCT = 0, velS = 0, velT = 0;
 
 // ── Logging ──────────────────────────────────────────────────────────────────
 const logBuf = [];
@@ -326,246 +366,388 @@ function jClass(i) {
   return 'c-other';
 }
 
-// ── WebGL Setup ─────────────────────────────────────────────────────────────
-const gl = imgCanvas.getContext('webgl');
-if (!gl) { log('[ERROR] WebGL을 지원하지 않는 브라우저입니다.', 'c-err'); flushLog(); }
+/* ══════════════════════════════════════════════════════════════════════════════
+   WebGL2 유체(물감) 변위 시뮬레이션
+   --------------------------------------------------------------------------------
+   - 변위 필드 D(vec2)를 부동소수 텍스처(RGBA16F)에 저장하고 ping-pong으로 갱신.
+   - 매 프레임 update 패스:
+       · 이웃 평균과 섞어(전파) 물결처럼 퍼지게 하고,
+       · damping으로 서서히 가라앉히며(물의 점성),
+       · 커서(손/마우스) 주변에 '밀어내는 힘' + 약한 스월(휘젓기)을 더한다.
+   - render 패스: 원본 그림 텍스처를 (uv − D + 전역 일렁임)에서 샘플 → 물감이
+     밀려나고 일렁이는 모습. 변위 기울기로 하이라이트를 더해 '젖은' 질감 표현.
+   ══════════════════════════════════════════════════════════════════════════════ */
+const SIM = 384;                 // 변위 필드 해상도 (정사각, uv 공간)
+let gl = null, glOK = false;
+let simProg = null, renderProg = null;
+let quadVAO = null;
+let imgTex = null, imgReady = false;
+let fieldA = null, fieldB = null; // {tex, fbo}
+let U = {};                       // uniform location 캐시
 
-// Vertex Shader: 화면을 덮는 사각형(Quad) 렌더링 및 UV 좌표 전달
-const vsSource = `
-  attribute vec2 a_position;
-  attribute vec2 a_texcoord;
-  varying vec2 v_texcoord;
-  void main() {
-    gl_Position = vec4(a_position, 0.0, 1.0);
-    v_texcoord = a_texcoord;
-  }
-`;
+const VERT_SRC = `#version 300 es
+in vec2 a_pos;
+out vec2 v_uv;
+void main(){
+  v_uv = a_pos * 0.5 + 0.5;     // (s,t)  s=0 좌, t=0 하
+  gl_Position = vec4(a_pos, 0.0, 1.0);
+}`;
 
-// Fragment Shader: 손 좌표를 중심으로 유화 물감이 흐르듯 픽셀 왜곡(Distortion) 처리
-const fsSource = `
-  precision mediump float;
-  varying vec2 v_texcoord;
-  
-  uniform sampler2D u_image;
-  uniform vec2 u_pointer;       // 손가락 위치 (0.0 ~ 1.0)
-  uniform float u_aspect;       // 화면 비율 (Width / Height)
-  uniform float u_strength;     // 효과 강도 (손이 있을 때 1.0으로 부드럽게 증가)
-  uniform float u_openness;     // 손가락 폄 정도 (0.0 주먹, 1.0 보자기)
-  
-  uniform vec2 u_resolution;    // 캔버스 해상도
-  uniform vec2 u_texResolution; // 텍스처(이미지) 원본 해상도
+// ── 시뮬레이션 업데이트 셰이더 ──
+const SIM_SRC = `#version 300 es
+precision highp float;
+in  vec2 v_uv;
+out vec4 outColor;
+uniform sampler2D u_prev;
+uniform vec2  u_texel;     // 1/SIM
+uniform vec2  u_cursor;    // 그림 uv 의 커서 위치
+uniform vec2  u_vel;       // 커서 속도 (스월/추진 방향)
+uniform float u_active;
+uniform float u_radius;    // uv 단위 반경
+uniform float u_strength;  // 미는 힘
+uniform float u_aspect;    // 그림 가로/세로 비 (원형 falloff 보정)
+uniform float u_damping;
+uniform float u_spread;
+void main(){
+  vec2 c = texture(u_prev, v_uv).xy;
+  vec2 l = texture(u_prev, v_uv - vec2(u_texel.x, 0.0)).xy;
+  vec2 r = texture(u_prev, v_uv + vec2(u_texel.x, 0.0)).xy;
+  vec2 u = texture(u_prev, v_uv - vec2(0.0, u_texel.y)).xy;
+  vec2 d = texture(u_prev, v_uv + vec2(0.0, u_texel.y)).xy;
+  vec2 avg = (l + r + u + d) * 0.25;
 
-  void main() {
-    vec2 uvCanvas = v_texcoord;
-    
-    // 1. 왜곡 효과 적용 (Canvas UV 기준)
-    vec2 diff = uvCanvas - u_pointer;
-    diff.x *= u_aspect; // 원형 유지를 위한 비율 보정
+  // 전파(이웃과 섞임) + 점성 감쇠
+  vec2 field = mix(c, avg, u_spread) * u_damping;
+
+  if (u_active > 0.5) {
+    vec2 diff = v_uv - u_cursor;
+    diff.x *= u_aspect;                 // 원형 보정
     float dist = length(diff);
-    
-    // 왜곡이 미치는 반경 (화면의 약 35%)
-    float radius = 0.35;
-    
-    if (dist < radius) {
-      // 거리에 따른 감쇠 (가운데일수록 강하게)
-      float falloff = smoothstep(radius, 0.0, dist);
-      float ease = pow(falloff, 1.5);
-      
-      // 회전(소용돌이) 강도: 주먹 쥘수록(openness 낮음) 더 강하게 휘감김
-      float swirlAmt = mix(6.0, 1.0, u_openness) * ease * u_strength;
-      float s = sin(swirlAmt);
-      float c = cos(swirlAmt);
-      mat2 rot = mat2(c, -s, s, c);
-      
-      diff = rot * diff;
-      
-      // 돌출/수축 강도: 주먹 쥐면 안으로 빨려가고(-), 펼치면 밀어냄(+)
-      float bulgeAmt = mix(-0.15, 0.10, u_openness) * ease * u_strength;
-      diff += normalize(diff) * bulgeAmt;
-    }
-    
-    diff.x /= u_aspect; // 비율 보정 원복
-    uvCanvas = u_pointer + diff;
-    
-    // 2. CSS object-fit: contain 효과 (이미지가 잘리지 않고 전체가 보이도록 수정)
-    vec2 s = u_resolution;
-    vec2 i = u_texResolution;
-    
-    // 캔버스 안에 텍스처를 맞추기 위한 축소 비율 계산
-    float scale = min(s.x / i.x, s.y / i.y);
-    vec2 renderSize = i * scale;
-    
-    // UV 좌표 변환 (중앙 정렬)
-    vec2 uvTex = (uvCanvas * s - (s - renderSize) * 0.5) / renderSize;
-    
-    // 캔버스의 남는 여백(Letterbox) 처리: 텍스처 범위를 벗어나면 배경색 출력
-    if (uvTex.x < 0.0 || uvTex.x > 1.0 || uvTex.y < 0.0 || uvTex.y > 1.0) {
-      gl_FragColor = vec4(0.027, 0.027, 0.063, 1.0); // #070710
-      return;
-    }
-    
-    // 색상 출력
-    gl_FragColor = texture2D(u_image, uvTex);
+    float fall = exp(-(dist * dist) / (u_radius * u_radius));
+    vec2 dir = dist > 1e-4 ? normalize(diff) : vec2(0.0);
+    vec2 swirl = vec2(-dir.y, dir.x);   // 접선 방향(휘젓기)
+    // 바깥으로 밀기 + 스월 + 손 이동 방향 추진
+    vec2 force = (dir * 0.9 + swirl * 0.35) * fall * u_strength;
+    force += u_vel * fall * 0.6;        // 손이 빠르게 지나가면 물감을 끌고 감
+    force.x /= u_aspect;                // uv 공간으로 환원
+    field += force;
   }
-`;
 
-function createShader(gl, type, source) {
-  const shader = gl.createShader(type);
-  gl.shaderSource(shader, source);
-  gl.compileShader(shader);
-  if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
-    console.error(gl.getShaderInfoLog(shader));
-    gl.deleteShader(shader);
-    return null;
+  field = clamp(field, vec2(-0.35), vec2(0.35));
+  outColor = vec4(field, 0.0, 1.0);
+}`;
+
+// ── 렌더 셰이더 ──
+const RENDER_SRC = `#version 300 es
+precision highp float;
+in  vec2 v_uv;
+out vec4 outColor;
+uniform sampler2D u_image;
+uniform sampler2D u_field;
+uniform vec2  u_canvas;     // 캔버스 픽셀 크기
+uniform vec4  u_imgRect;    // ox, oy, iw, ih  (GL 기준, 좌하 원점)
+uniform vec2  u_texel;      // 1/SIM
+uniform float u_time;
+uniform float u_shimmer;    // 전역 일렁임 진폭
+uniform float u_dispScale;  // 변위 강도
+uniform vec3  u_bg;
+void main(){
+  vec2 px = v_uv * u_canvas;                       // 캔버스 픽셀 (좌하 원점)
+  vec2 st = (px - u_imgRect.xy) / u_imgRect.zw;    // 그림 uv (contain 영역)
+
+  if (st.x < 0.0 || st.x > 1.0 || st.y < 0.0 || st.y > 1.0) {
+    outColor = vec4(u_bg, 1.0);                    // 레터박스 영역 = 배경
+    return;
   }
-  return shader;
+
+  vec2 disp = texture(u_field, st).xy;
+
+  // 전역 일렁임 (잔잔한 물결 — 항상 흐름)
+  vec2 flow = vec2(
+    sin(st.y * 7.0 + u_time * 0.7) + sin(st.x * 4.0 - u_time * 0.5),
+    cos(st.x * 7.0 - u_time * 0.6) + cos(st.y * 4.0 + u_time * 0.45)
+  ) * u_shimmer;
+
+  vec2 sampleUV = st - disp * u_dispScale + flow;
+  sampleUV = clamp(sampleUV, vec2(0.0), vec2(1.0));
+  vec3 col = texture(u_image, sampleUV).rgb;
+
+  // 변위 기울기 → 물 표면 하이라이트 (젖은 물감 느낌)
+  vec2 dl = texture(u_field, st - vec2(u_texel.x, 0.0)).xy;
+  vec2 dr = texture(u_field, st + vec2(u_texel.x, 0.0)).xy;
+  vec2 du = texture(u_field, st - vec2(0.0, u_texel.y)).xy;
+  vec2 dd = texture(u_field, st + vec2(0.0, u_texel.y)).xy;
+  float gx = (dr.x - dl.x) + (dr.y - dl.y);
+  float gy = (dd.x - du.x) + (dd.y - du.y);
+  float spec = clamp((gx - gy) * 6.0, -0.25, 0.45);
+  col += vec3(0.6, 0.7, 1.0) * spec * 0.5;         // 푸른빛 윤슬
+
+  outColor = vec4(col, 1.0);
+}`;
+
+function compile(type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src);
+  gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+    throw new Error('Shader compile: ' + gl.getShaderInfoLog(sh));
+  }
+  return sh;
+}
+function makeProgram(vsSrc, fsSrc) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vsSrc));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fsSrc));
+  gl.bindAttribLocation(p, 0, 'a_pos');
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+    throw new Error('Program link: ' + gl.getProgramInfoLog(p));
+  }
+  return p;
+}
+function makeField(w, h) {
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, w, h, 0, gl.RGBA, gl.HALF_FLOAT, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  const fbo = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  gl.clearColor(0, 0, 0, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  return { tex, fbo };
 }
 
-const vertexShader = createShader(gl, gl.VERTEX_SHADER, vsSource);
-const fragmentShader = createShader(gl, gl.FRAGMENT_SHADER, fsSource);
-const program = gl.createProgram();
-gl.attachShader(program, vertexShader);
-gl.attachShader(program, fragmentShader);
-gl.linkProgram(program);
+function initGL() {
+  gl = imgCanvas.getContext('webgl2', { antialias: false, premultipliedAlpha: false });
+  if (!gl) { glErrEl.style.display = 'flex'; log('[ERROR] WebGL2 미지원', 'c-err'); flushLog(); return false; }
+  if (!gl.getExtension('EXT_color_buffer_float')) {
+    glErrEl.style.display = 'flex';
+    log('[ERROR] EXT_color_buffer_float 미지원', 'c-err'); flushLog(); return false;
+  }
 
-// 속성 및 유니폼 위치 매핑
-const aPositionLoc = gl.getAttribLocation(program, "a_position");
-const aTexcoordLoc = gl.getAttribLocation(program, "a_texcoord");
-const uPointerLoc = gl.getUniformLocation(program, "u_pointer");
-const uAspectLoc = gl.getUniformLocation(program, "u_aspect");
-const uStrengthLoc = gl.getUniformLocation(program, "u_strength");
-const uOpennessLoc = gl.getUniformLocation(program, "u_openness");
-const uResolutionLoc = gl.getUniformLocation(program, "u_resolution");
-const uTexResolutionLoc = gl.getUniformLocation(program, "u_texResolution");
+  try {
+    simProg    = makeProgram(VERT_SRC, SIM_SRC);
+    renderProg = makeProgram(VERT_SRC, RENDER_SRC);
+  } catch (e) {
+    glErrEl.style.display = 'flex';
+    log('[ERROR] ' + e.message, 'c-err'); flushLog(); return false;
+  }
 
-// 버퍼 생성 (Quad)
-const positionBuffer = gl.createBuffer();
-gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
-gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
-  -1,  1,   // top left
-  -1, -1,   // bottom left
-   1,  1,   // top right
-   1, -1    // bottom right
-]), gl.STATIC_DRAW);
+  // 풀스크린 쿼드
+  const quad = new Float32Array([-1,-1, 1,-1, -1,1,  -1,1, 1,-1, 1,1]);
+  quadVAO = gl.createVertexArray();
+  gl.bindVertexArray(quadVAO);
+  const vbo = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+  gl.bufferData(gl.ARRAY_BUFFER, quad, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+  gl.bindVertexArray(null);
 
-const texcoordBuffer = gl.createBuffer();
-gl.bindBuffer(gl.ARRAY_BUFFER, texcoordBuffer);
-// HTML Canvas 좌표계(Top-Left: 0,0)에 맞게 텍스처 좌표 할당
-gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
-   0,  0,
-   0,  1,
-   1,  0,
-   1,  1
-]), gl.STATIC_DRAW);
+  fieldA = makeField(SIM, SIM);
+  fieldB = makeField(SIM, SIM);
 
-// 텍스처 초기화
-const texture = gl.createTexture();
-let imageLoaded = false;
-let texWidth = 1, texHeight = 1;
+  // uniform 캐시
+  U.sim = {
+    prev:     gl.getUniformLocation(simProg, 'u_prev'),
+    texel:    gl.getUniformLocation(simProg, 'u_texel'),
+    cursor:   gl.getUniformLocation(simProg, 'u_cursor'),
+    vel:      gl.getUniformLocation(simProg, 'u_vel'),
+    active:   gl.getUniformLocation(simProg, 'u_active'),
+    radius:   gl.getUniformLocation(simProg, 'u_radius'),
+    strength: gl.getUniformLocation(simProg, 'u_strength'),
+    aspect:   gl.getUniformLocation(simProg, 'u_aspect'),
+    damping:  gl.getUniformLocation(simProg, 'u_damping'),
+    spread:   gl.getUniformLocation(simProg, 'u_spread'),
+  };
+  U.render = {
+    image:     gl.getUniformLocation(renderProg, 'u_image'),
+    field:     gl.getUniformLocation(renderProg, 'u_field'),
+    canvas:    gl.getUniformLocation(renderProg, 'u_canvas'),
+    imgRect:   gl.getUniformLocation(renderProg, 'u_imgRect'),
+    texel:     gl.getUniformLocation(renderProg, 'u_texel'),
+    time:      gl.getUniformLocation(renderProg, 'u_time'),
+    shimmer:   gl.getUniformLocation(renderProg, 'u_shimmer'),
+    dispScale: gl.getUniformLocation(renderProg, 'u_dispScale'),
+    bg:        gl.getUniformLocation(renderProg, 'u_bg'),
+  };
 
-function loadImage(src, name) {
-  const img = new Image();
-  img.crossOrigin = "anonymous"; // 외부 URL(Wikimedia) 접근용 CORS 허용
-  img.onload = () => {
-    gl.bindTexture(gl.TEXTURE_2D, texture);
+  glOK = true;
+  log('[INFO ] WebGL2 유체 셰이더 초기화 완료 ✓ (필드 ' + SIM + '²)', 'c-ok');
+  flushLog();
+  return true;
+}
+
+function uploadTexture(img) {
+  if (!glOK) return;
+  if (!imgTex) imgTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, imgTex);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);   // 화면에 똑바로 보이도록
+  try {
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-    
-    imageLoaded = true;
-    texWidth = img.width;
-    texHeight = img.height;
-    
-    const short = name.length > 40 ? name.slice(0, 38) + '…' : name;
+  } catch (e) {
+    log('[ERROR] 텍스처 업로드 실패(CORS?): ' + e.message, 'c-err'); flushLog(); return;
+  }
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+  imgReady = true;
+}
+
+// 현재 캔버스에 그림을 'contain'으로 맞춘 사각형(GL 좌하 원점, 픽셀)
+function containRect(cw, ch) {
+  const ar = imgNatW / imgNatH, car = cw / ch;
+  let iw, ih, ox, oy;
+  if (ar > car) { iw = cw; ih = cw / ar; ox = 0; oy = (ch - ih) / 2; }
+  else          { ih = ch; iw = ch * ar; oy = 0; ox = (cw - iw) / 2; }
+  return { ox, oy, iw, ih, ar };
+}
+
+let glTime = 0;
+function renderGL(ts) {
+  if (!glOK) return;
+  const cw = imgCanvas.offsetWidth, ch = imgCanvas.offsetHeight;
+  if (cw < 1 || ch < 1) return;
+  if (imgCanvas.width !== cw || imgCanvas.height !== ch) {
+    imgCanvas.width = cw; imgCanvas.height = ch;
+  }
+  glTime = ts * 0.001;
+
+  // ── 커서 결정 (손 우선, 없으면 마우스) ──
+  let cs = 0, cct = 0, active = false, openForR = smoothOpen;
+  if (handActive)      { cs = handS;  cct = handT;  active = true; openForR = smoothOpen; }
+  else if (mouseActive){ cs = mouseS; cct = mouseT; active = true; openForR = 0.7; }
+
+  // 커서 속도(저역통과)
+  if (active) {
+    velS = velS * 0.6 + (cs - prevCS) * 0.4;
+    velT = velT * 0.6 + (cct - prevCT) * 0.4;
+    prevCS = cs; prevCT = cct;
+  } else { velS *= 0.8; velT *= 0.8; }
+
+  const rect = imgReady ? containRect(cw, ch) : { ox: 0, oy: 0, iw: cw, ih: ch, ar: cw / ch };
+
+  // 손 펼침에 따라 반경·세기 증가
+  const radius   = 0.06 + openForR * 0.18;
+  const strength = 0.010 + openForR * 0.030;
+
+  // ── 1) 시뮬레이션 업데이트 (fieldA → fieldB) ──
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fieldB.fbo);
+  gl.viewport(0, 0, SIM, SIM);
+  gl.useProgram(simProg);
+  gl.bindVertexArray(quadVAO);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, fieldA.tex);
+  gl.uniform1i(U.sim.prev, 0);
+  gl.uniform2f(U.sim.texel, 1 / SIM, 1 / SIM);
+  gl.uniform2f(U.sim.cursor, cs, cct);
+  gl.uniform2f(U.sim.vel, velS, velT);
+  gl.uniform1f(U.sim.active, active ? 1 : 0);
+  gl.uniform1f(U.sim.radius, radius);
+  gl.uniform1f(U.sim.strength, strength);
+  gl.uniform1f(U.sim.aspect, rect.ar);
+  gl.uniform1f(U.sim.damping, 0.965);   // ↑ 물결 오래 지속
+  gl.uniform1f(U.sim.spread, 0.16);     // 전파 정도
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+  // swap
+  const tmp = fieldA; fieldA = fieldB; fieldB = tmp;
+
+  // ── 2) 화면 렌더 ──
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, cw, ch);
+  gl.clearColor(7/255, 7/255, 16/255, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+
+  if (imgReady) {
+    gl.useProgram(renderProg);
+    gl.bindVertexArray(quadVAO);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, imgTex);
+    gl.uniform1i(U.render.image, 0);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, fieldA.tex);
+    gl.uniform1i(U.render.field, 1);
+    gl.uniform2f(U.render.canvas, cw, ch);
+    gl.uniform4f(U.render.imgRect, rect.ox, rect.oy, rect.iw, rect.ih);
+    gl.uniform2f(U.render.texel, 1 / SIM, 1 / SIM);
+    gl.uniform1f(U.render.time, glTime);
+    gl.uniform1f(U.render.shimmer, 0.0022);
+    gl.uniform1f(U.render.dispScale, 1.0);
+    gl.uniform3f(U.render.bg, 7/255, 7/255, 16/255);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+  }
+  gl.bindVertexArray(null);
+
+  // ── 좌표 추적 오버레이 ──
+  const pct = Math.round(smoothOpen * 100);
+  openFill.style.width  = pct + '%';
+  openLabel.textContent = `OPEN  ${pct}%`;
+  if (active) {
+    const ipx = Math.round(cs * imgNatW), ipy = Math.round((1 - cct) * imgNatH);
+    coordEl.textContent =
+      `${handActive ? 'HAND ' : 'MOUSE'}  uv(${cs.toFixed(3)}, ${(1 - cct).toFixed(3)})\n` +
+      `IMG  px(${ipx}, ${ipy}) / ${imgNatW}×${imgNatH}\n` +
+      `R ${(radius*100).toFixed(0)}%   OPEN ${pct}%`;
+  } else {
+    coordEl.textContent = '손을 보여주거나 그림 위로\n마우스를 움직이세요';
+  }
+}
+
+// ── Image loading ─────────────────────────────────────────────────────────────
+function loadImage(src, name, isDefault) {
+  const img = new Image();
+  if (isDefault) img.crossOrigin = 'anonymous';
+  img.onload = () => {
+    uploadedImg = img;
+    imgNatW = img.naturalWidth; imgNatH = img.naturalHeight;
+    imgReady = false;
+    uploadTexture(img);
+    const short = name.length > 44 ? name.slice(0, 42) + '…' : name;
     fnameEl.textContent = short;
-    log(`[WebGL] 이미지 텍스처 업로드 완료: ${short}`, 'c-log');
+    log(`[IMAGE] 로드 완료: ${short}`, 'c-log');
+    log(`[IMAGE] 원본 해상도  ${imgNatW} × ${imgNatH}`, 'c-log');
     flushLog();
   };
-  img.onerror = () => {
-    log(`[ERROR] 이미지 로드 실패 (CORS 등). 로컬 이미지를 업로드해보세요.`, 'c-err');
-    flushLog();
-  };
+  img.onerror = () => { log(`[ERROR] 이미지 로드 실패: ${name}`, 'c-err'); flushLog(); };
   img.src = src;
 }
 
 document.getElementById('btn-upload').addEventListener('click', () => fileInput.click());
 fileInput.addEventListener('change', () => {
   const f = fileInput.files[0];
-  if (f) loadImage(URL.createObjectURL(f), f.name);
+  if (f) loadImage(URL.createObjectURL(f), f.name, false);
 });
-loadImage(DEFAULT_IMG, "Van_Gogh_Starry_Night.jpg");
 
-// ── WebGL Render Loop 변수 ───────────────────────────────────────────────────
-let curPointer = { x: 0.5, y: 0.5 };
-let tarPointer = { x: 0.5, y: 0.5 };
-let curStrength = 0.0;
-
-function renderWebGL(ts) {
-  const cw = imgCanvas.offsetWidth;
-  const ch = imgCanvas.offsetHeight;
-  if (cw < 1 || ch < 1) return;
-  
-  if (imgCanvas.width !== cw || imgCanvas.height !== ch) {
-    imgCanvas.width = cw;
-    imgCanvas.height = ch;
-    gl.viewport(0, 0, cw, ch);
-  }
-
-  if (!imageLoaded) {
-    // 배경만 검정으로 지움
-    gl.clearColor(0.04, 0.04, 0.06, 1.0);
-    gl.clear(gl.COLOR_BUFFER_BIT);
-    return;
-  }
-
-  gl.useProgram(program);
-
-  // 상호작용 부드러운 보간 처리 (선형 보간 - LERP)
-  if (handPresent) {
-    curPointer.x += (tarPointer.x - curPointer.x) * 0.15;
-    curPointer.y += (tarPointer.y - curPointer.y) * 0.15;
-    curStrength  += (1.0 - curStrength) * 0.08;
-  } else {
-    curStrength  += (0.0 - curStrength) * 0.05;
-  }
-
-  // Uniform 값 전송
-  gl.uniform2f(uPointerLoc, curPointer.x, curPointer.y);
-  gl.uniform1f(uAspectLoc, cw / ch);
-  gl.uniform1f(uStrengthLoc, curStrength);
-  gl.uniform1f(uOpennessLoc, smoothOpen);
-  gl.uniform2f(uResolutionLoc, cw, ch);
-  gl.uniform2f(uTexResolutionLoc, texWidth, texHeight);
-
-  // 드로우
-  gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
-  gl.vertexAttribPointer(aPositionLoc, 2, gl.FLOAT, false, 0, 0);
-  gl.enableVertexAttribArray(aPositionLoc);
-
-  gl.bindBuffer(gl.ARRAY_BUFFER, texcoordBuffer);
-  gl.vertexAttribPointer(aTexcoordLoc, 2, gl.FLOAT, false, 0, 0);
-  gl.enableVertexAttribArray(aTexcoordLoc);
-
-  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-}
+// ── 마우스 폴백 → 그림 uv(s,t) 로 변환 (contain 영역 기준) ──
+imgContainer.addEventListener('mousemove', (e) => {
+  const r = imgCanvas.getBoundingClientRect();
+  const cw = r.width, ch = r.height;
+  const rect = containRect(cw, ch);
+  const x = e.clientX - r.left;
+  const yTop = e.clientY - r.top;
+  const yGL = ch - yTop;                       // GL 좌하 원점
+  mouseS = (x - rect.ox) / rect.iw;
+  mouseT = (yGL - rect.oy) / rect.ih;
+  mouseActive = (mouseS >= 0 && mouseS <= 1 && mouseT >= 0 && mouseT <= 1);
+});
+imgContainer.addEventListener('mouseleave', () => { mouseActive = false; });
 
 // ── Openness detection ────────────────────────────────────────────────────────
-// Returns 0.0 (fist) … 1.0 (fully open) based on fingertip distances from wrist.
 function calcOpenness(lms) {
-  const wrist   = lms[0];
-  const palmRef = lms[9];
-  const palmSz  = Math.hypot(palmRef.x - wrist.x, palmRef.y - wrist.y);
+  const wrist = lms[0], palmRef = lms[9];
+  const palmSz = Math.hypot(palmRef.x - wrist.x, palmRef.y - wrist.y);
   if (palmSz < 0.01) return smoothOpen;
-
   let sum = 0;
   for (const id of [8, 12, 16, 20])
     sum += Math.hypot(lms[id].x - wrist.x, lms[id].y - wrist.y);
-
   return Math.max(0, Math.min(1, (sum / 4 / palmSz - 1.0) / 1.5));
 }
-
 
 // ── MediaPipe init ────────────────────────────────────────────────────────────
 let detector = null, lastVideoTime = -1;
@@ -591,7 +773,7 @@ async function init() {
     minHandPresenceConfidence:  0.5,
     minTrackingConfidence:      0.5,
   });
-  log('[INFO ] 인공지능 모델 로드 완료 ✓');
+  log('[INFO ] 모델 로드 완료 ✓');
 
   try {
     const stream = await navigator.mediaDevices.getUserMedia({
@@ -599,15 +781,15 @@ async function init() {
     });
     webcam.srcObject = stream;
     webcam.addEventListener('loadeddata', () => {
-      log('[INFO ] 카메라 준비 완료 ✓');
-      log(`[INFO ] ✊ 주먹 → 물감을 강하게 뒤섞음 (Swirl)`);
-      log(`[INFO ] ✋ 펴기 → 물감을 밖으로 밀어냄 (Push)`);
+      log('[INFO ] 카메라 준비 ✓');
+      log(`[INFO ] 해상도  ${webcam.videoWidth} × ${webcam.videoHeight}`);
+      log('[INFO ] 손=그림 좌표 1:1 비례 매핑  ✋ 펴기 → 넓게 일렁임   ✊ 주먹 → 좁게', 'c-hdr');
       flushLog();
       requestAnimationFrame(loop);
     });
   } catch (err) {
     log(`[ERROR] 카메라: ${err.message}`, 'c-err');
-    log('[HINT ] python -m http.server 8080 → localhost:8080 으로 실행', 'c-hdr');
+    log('[HINT ] 카메라 없이도 그림 위로 마우스를 움직이면 동작합니다.', 'c-hdr');
     noCamMsg.style.display = 'flex';
     flushLog();
     requestAnimationFrame(loop);
@@ -618,55 +800,48 @@ async function init() {
 function loop(ts) {
   const dt = ts - lastTs || 16;
   lastTs = ts;
-  fps    = fps * 0.88 + (1000 / dt) * 0.12;
+  fps = fps * 0.88 + (1000 / dt) * 0.12;
   fpsBadge.textContent = `${fps.toFixed(1)} fps`;
 
-  // Hand detection
   if (detector && webcam.readyState >= 2 && webcam.currentTime !== lastVideoTime) {
     lastVideoTime = webcam.currentTime;
 
     const dw = webcam.offsetWidth, dh = webcam.offsetHeight;
-    if (overlay.width !== dw || overlay.height !== dh) {
-      overlay.width = dw; overlay.height = dh;
-    }
+    if (overlay.width !== dw || overlay.height !== dh) { overlay.width = dw; overlay.height = dh; }
 
     const result = detector.detectForVideo(webcam, ts);
     ctx.clearRect(0, 0, dw, dh);
 
     if (result.landmarks.length > 0) {
-      const lms  = result.landmarks[0];
+      const lms = result.landmarks[0];
       handPresent = true;
+      handActive  = true;
       targetOpen  = calcOpenness(lms);
-      
-      // 🖐️ 상호작용 핵심 지표: 검지 손가락 끝(Landmark 8) 기준
-      // 중요: 웹캠은 transform: scaleX(-1)로 반전되어 있으므로, X좌표를 반전시켜야 화면 상의 거울상과 동기화됨.
-      tarPointer.x = 1.0 - lms[8].x;
-      tarPointer.y = lms[8].y;
+
+      // ── 카메라 → 그림 비례 매핑 ──
+      // 웹캠은 좌우 반전 표시 → s = 1 - x.   카메라 y(위=0) → GL t(위=1) → t = 1 - y.
+      // 결과적으로 카메라 프레임 전체가 그림 전체(uv 0~1)에 1:1 비례 대응하여,
+      // 주먹(landmark 9 = 손바닥 중심) 위치가 그림의 같은 상대 위치에 놓인다.
+      handS = 1 - lms[9].x;
+      handT = 1 - lms[9].y;
 
       drawSkeleton(lms, dw, dh);
       renderJoints(lms, webcam.videoWidth, webcam.videoHeight);
-      statusBadge.textContent = targetOpen < 0.35 ? '✊ GRIP' : '✋ OPEN';
+      statusBadge.textContent = targetOpen < 0.35 ? '✊ FIST' : '✋ OPEN';
       statusBadge.className   = 'badge status-ok';
     } else {
       handPresent = false;
+      handActive  = false;
       renderWaiting();
       statusBadge.textContent = 'NO HAND';
       statusBadge.className   = 'badge status-bad';
     }
   }
 
-  // Smooth openness easing
-  const ease  = handPresent ? 0.075 : 0.030;
+  const ease = handPresent ? 0.075 : 0.030;
   smoothOpen += (targetOpen - smoothOpen) * ease;
 
-  // Openness bar UI update
-  const pct = Math.round(smoothOpen * 100);
-  openFill.style.width  = pct + '%';
-  openLabel.textContent = `HAND OPENNESS  ${pct}%`;
-
-  // WebGL Renderer 호출
-  renderWebGL(ts);
-
+  renderGL(ts);
   requestAnimationFrame(loop);
 }
 
@@ -689,14 +864,6 @@ function drawSkeleton(lms, w, h) {
     ctx.beginPath(); ctx.arc(x, y, r + 2.5, 0, Math.PI * 2); ctx.fill();
     ctx.fillStyle = c;
     ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
-    
-    // 검지 끝부분(8번) 강조 마커
-    if (i === 8) {
-      ctx.strokeStyle = '#fff';
-      ctx.lineWidth = 1.5;
-      ctx.beginPath(); ctx.arc(x, y, r + 4, 0, Math.PI * 2); ctx.stroke();
-    }
-
     ctx.fillStyle = c;
     ctx.font = 'bold 11px Consolas, monospace';
     ctx.fillText(String(i), x + 10, y - 6);
@@ -720,11 +887,13 @@ function renderJoints(lms, fw, fh) {
 
 function renderWaiting() {
   infoText.innerHTML = logBuf.slice(-14).join('\n')
-    + '\n<span class="c-log">  화면에 손을 보여주세요 (검지 끝 추적)…</span>';
+    + '\n<span class="c-log">  손을 카메라에 보여주세요…</span>';
   infoBody.scrollTop = 99999;
 }
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
+initGL();
+loadImage(DEFAULT_IMG, 'Van Gogh — The Starry Night (1889)', true);
 init().catch(err => {
   log(`[ERROR] ${err}`, 'c-err');
   flushLog();
